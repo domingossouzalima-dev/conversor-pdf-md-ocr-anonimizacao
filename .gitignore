@@ -1,0 +1,10 @@
+# Pastas de trabalho: nunca versionar documentos reais do usuário
+arquivos_de_entrada/*/*
+!arquivos_de_entrada/*/.gitkeep
+arquivos_convertidos/
+log/
+.tmp_ocr/
+
+# Python
+__pycache__/
+*.pyc

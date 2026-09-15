@@ -8,20 +8,20 @@ Licenciado sob a licença MIT. Veja o arquivo LICENSE na raiz do repositório.
 
 ESTRUTURA DE DIRETÓRIOS OPERADOS (caminhos relativos à raiz do repositório):
   Entrada:
-    - material/padrao/          -> Conversão com texto nativo e fallback OCR
-    - material/ocr/             -> Conversão com OCR FORÇADO em todas as páginas
-    - material/anonimizacao/    -> Conversão com anonimização de dados pessoais/sigilosos
-    - material/desanonimizacao/ -> Reversão: solte aqui o documento anonimizado junto
-                                    com sua respectiva chave (arquivo
-                                    "chave_de_desanonimizacao_*.md"); o script casa os
-                                    dois sozinho pelo nome/código de referência, mesmo
-                                    com vários pares juntos.
+    - arquivos_de_entrada/padrao/          -> Conversão com texto nativo e fallback OCR
+    - arquivos_de_entrada/ocr/             -> Conversão com OCR FORÇADO em todas as páginas
+    - arquivos_de_entrada/anonimizacao/    -> Conversão com anonimização (Res. CNJ 615/2025)
+    - arquivos_de_entrada/desanonimizacao/ -> Reversão: solte aqui o documento anonimizado
+                                               junto com sua respectiva chave (arquivo
+                                               "chave_de_desanonimizacao_*.md"); o script
+                                               casa os dois sozinho pelo nome/código de
+                                               referência, mesmo com vários pares juntos.
 
   Saída:
-    - conversoes/padrao/AAAA-MM-DD/
-    - conversoes/ocr/AAAA-MM-DD/
-    - conversoes/anonimizacao/AAAA-MM-DD/
-    - conversoes/desanonimizacao/AAAA-MM-DD/<nome>/
+    - arquivos_convertidos/padrao/AAAA-MM-DD/
+    - arquivos_convertidos/ocr/AAAA-MM-DD/
+    - arquivos_convertidos/anonimizacao/AAAA-MM-DD/
+    - arquivos_convertidos/desanonimizacao/AAAA-MM-DD/<nome>/
         -> pasta por documento, contendo: o documento anonimizado original,
            a chave usada e o "desanonimizado_*.md" já revertido/preenchido.
 
@@ -74,14 +74,11 @@ try:
 except ImportError:
     TEM_PDF2IMAGE = False
 
-# Diretórios base dinâmicos (compatíveis com Linux e Windows).
-# Este script vive em <repo>/scripts/, então a raiz do repositório é o
-# diretório pai imediato — os dados de entrada/saída ficam sempre ao
-# lado do código (material/, conversoes/, log/), nunca dentro dele.
+# Diretórios base dinâmicos (compatíveis com Linux e Windows)
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASE_DIR = SCRIPT_DIR.parent  # raiz do repositório
-MATERIAL_DIR = BASE_DIR / "material"
-CONVERSOES_DIR = BASE_DIR / "conversoes"
+ENTRADA_DIR = BASE_DIR / "arquivos_de_entrada"
+SAIDA_DIR = BASE_DIR / "arquivos_convertidos"
 LOG_DIR = BASE_DIR / "log"
 TMP_OCR_DIR = BASE_DIR / ".tmp_ocr"
 
@@ -123,29 +120,29 @@ def obter_executavel_ocrmypdf() -> list[str] | None:
 
 MODOS = {
     "padrao": {
-        "entrada": MATERIAL_DIR / "padrao",
-        "saida": CONVERSOES_DIR / "padrao",
+        "entrada": ENTRADA_DIR / "padrao",
+        "saida": SAIDA_DIR / "padrao",
         "descricao": "Padrão (Texto Nativo com OCR automático em páginas escaneadas)",
         "forcar_ocr": False,
         "anonimizar": False,
     },
     "ocr": {
-        "entrada": MATERIAL_DIR / "ocr",
-        "saida": CONVERSOES_DIR / "ocr",
+        "entrada": ENTRADA_DIR / "ocr",
+        "saida": SAIDA_DIR / "ocr",
         "descricao": "OCR Otimizado (Estratégia 2: OCRmyPDF com Deskew, Rotação e Limpeza; Fallback 300 DPI)",
         "forcar_ocr": True,
         "anonimizar": False,
     },
     "anonimizacao": {
-        "entrada": MATERIAL_DIR / "anonimizacao",
-        "saida": CONVERSOES_DIR / "anonimizacao",
+        "entrada": ENTRADA_DIR / "anonimizacao",
+        "saida": SAIDA_DIR / "anonimizacao",
         "descricao": "Anonimização Forense (Resolução CNJ nº 615/2025)",
         "forcar_ocr": False,
         "anonimizar": True,
     },
     "desanonimizacao": {
-        "entrada": MATERIAL_DIR / "desanonimizacao",
-        "saida": CONVERSOES_DIR / "desanonimizacao",
+        "entrada": ENTRADA_DIR / "desanonimizacao",
+        "saida": SAIDA_DIR / "desanonimizacao",
         "descricao": "Desanonimização (reverte um documento anonimizado usando sua chave)",
         "forcar_ocr": False,
         "anonimizar": False,
@@ -279,7 +276,7 @@ def atualizar_progresso(
     t_inicio: float,
     fase: str = "",
 ):
-    """Atualiza progresso no terminal e em 12-conversoes/log/progresso.json."""
+    """Atualiza progresso no terminal e em log/progresso.json."""
     porcentagem = (pag_atual / total_pags) * 100 if total_pags > 0 else 0
     t_decorrido = time.time() - t_inicio
     if pag_atual > 0:
@@ -349,8 +346,19 @@ def executar_ocrmypdf(
     idioma: str = "por",
     nome_doc: str = "",
     t_inicio: float = None,
+    forcar_ocr: bool = True,
 ) -> bool:
-    """Executa o OCRmyPDF com deskew, rotação automática de páginas e limpeza profunda (Estratégia 2)."""
+    """Executa o OCRmyPDF com deskew, rotação automática de páginas e limpeza profunda (Estratégia 2).
+
+    forcar_ocr=True usa --force-ocr (reprocessa TODAS as páginas via OCR,
+    descartando texto nativo existente) — usado no modo "ocr" dedicado.
+    forcar_ocr=False usa --skip-text (modo híbrido: preserva o texto nativo
+    das páginas que já têm texto e aplica deskew/rotação/limpeza + OCR
+    apenas nas páginas sem texto) — usado nos modos "padrao" e
+    "anonimizacao", que antes desta correção nunca chamavam o OCRmyPDF e
+    caíam direto no fallback página a página sem deskew/limpeza, deixando
+    passar páginas escaneadas tortas/ruidosas sem OCR efetivo.
+    """
     cmd_base = obter_executavel_ocrmypdf()
     if not cmd_base:
         return False
@@ -364,7 +372,7 @@ def executar_ocrmypdf(
         "--rotate-pages",
         "--deskew",
         "--clean",
-        "--force-ocr",
+        "--force-ocr" if forcar_ocr else "--skip-text",
         "--jobs", "0",
         str(caminho_entrada),
         str(caminho_saida),
@@ -436,12 +444,45 @@ def converter_pdf_para_md(caminho_pdf: Path, forcar_ocr: bool = False, idioma: s
     else:
         raise RuntimeError("Nenhum motor de leitura de PDF disponível (PyMuPDF ou pypdf necessários).")
 
-    # 2. ESTRATÉGIA 2: Pré-processamento avançado com OCRmyPDF se for modo OCR
+    # 2. ESTRATÉGIA 2: Pré-processamento avançado com OCRmyPDF — SEMPRE que
+    #    disponível, não apenas no modo "ocr" forçado. Nos modos "padrao" e
+    #    "anonimizacao" (forcar_ocr=False) usa-se --skip-text (preserva
+    #    texto nativo já bom, aplica deskew/rotação/limpeza + OCR só nas
+    #    páginas sem texto). Sem isso, páginas escaneadas tortas ou com
+    #    ruído nunca recebiam deskew/limpeza e o OCR de fallback (Tesseract
+    #    puro, sem pré-processamento) falhava ou produzia texto incompleto
+    #    nessas páginas — a causa raiz de páginas "em branco"/com erro e de
+    #    dados pessoais não detectados pela anonimização (o motor de
+    #    anonimização não consegue mascarar o que o OCR nunca extraiu).
     sucesso_ocrmypdf = False
     pdf_para_leitura = caminho_pdf
     pdf_temp_saida = None
 
-    if forcar_ocr and obter_executavel_ocrmypdf() is not None:
+    # Antes de reescrever o PDF, identifica quais páginas já têm texto
+    # nativo suficiente — usado só para rotular corretamente (na saída)
+    # quais páginas passaram por OCR quando o modo é híbrido (--skip-text),
+    # já que nesse modo o OCRmyPDF não relata isso página a página.
+    paginas_sem_texto_nativo = set()
+    if not forcar_ocr:
+        try:
+            if TEM_PYMUPDF:
+                with fitz.open(str(caminho_pdf)) as d_scan:
+                    for j in range(len(d_scan)):
+                        if len(d_scan[j].get_text("text").strip()) < MIN_CHARS_TEXTO_NATIVO:
+                            paginas_sem_texto_nativo.add(j + 1)
+            elif TEM_PYPDF:
+                leitor_scan = PdfReader(str(caminho_pdf))
+                for j, pag_scan in enumerate(leitor_scan.pages):
+                    try:
+                        texto_scan = (pag_scan.extract_text() or "").strip()
+                    except Exception:
+                        texto_scan = ""
+                    if len(texto_scan) < MIN_CHARS_TEXTO_NATIVO:
+                        paginas_sem_texto_nativo.add(j + 1)
+        except Exception:
+            pass
+
+    if obter_executavel_ocrmypdf() is not None:
         TMP_OCR_DIR.mkdir(parents=True, exist_ok=True)
         timestamp_ms = int(time.time() * 1000)
         pdf_temp_saida = TMP_OCR_DIR / f"ocr_{timestamp_ms}_{caminho_pdf.name}"
@@ -452,16 +493,20 @@ def converter_pdf_para_md(caminho_pdf: Path, forcar_ocr: bool = False, idioma: s
             idioma=idioma,
             nome_doc=nome_doc,
             t_inicio=t_inicio,
+            forcar_ocr=forcar_ocr,
         )
         if sucesso_ocrmypdf:
             pdf_para_leitura = pdf_temp_saida
-            motor_utilizado = "OCRmyPDF (Deskew, Rotação Automática, Limpeza de Ruído e OCR) [Estratégia 2]"
+            if forcar_ocr:
+                motor_utilizado = "OCRmyPDF (Deskew, Rotação Automática, Limpeza de Ruído e OCR Forçado) [Estratégia 2]"
+            else:
+                motor_utilizado = "OCRmyPDF (Deskew, Rotação Automática, Limpeza de Ruído; OCR apenas em páginas sem texto) [Estratégia 2 Híbrida]"
 
     if not sucesso_ocrmypdf:
         if forcar_ocr:
             motor_utilizado = "PyMuPDF + Tesseract 300 DPI (Renderização página a página) [Estratégia 1 / Fallback]"
         else:
-            motor_utilizado = "PyMuPDF (Texto Nativo com fallback OCR Tesseract em páginas escaneadas)"
+            motor_utilizado = "PyMuPDF (Texto Nativo com fallback OCR Tesseract em páginas escaneadas) [Fallback]"
 
     # 3. Extração estruturada do texto página a página
     try:
@@ -474,8 +519,11 @@ def converter_pdf_para_md(caminho_pdf: Path, forcar_ocr: bool = False, idioma: s
                         pagina = doc[i]
                         texto = pagina.get_text("text").strip()
                         num_pag = i + 1
-                        paginas_ocr.append(num_pag)
-                        tag_tipo = " (OCR Otimizado - OCRmyPDF)"
+                        if forcar_ocr or num_pag in paginas_sem_texto_nativo:
+                            paginas_ocr.append(num_pag)
+                            tag_tipo = " (OCR Otimizado - OCRmyPDF)"
+                        else:
+                            tag_tipo = ""
                     else:
                         texto, usou_ocr = processar_pagina_pymupdf(doc, i, forcar_ocr, idioma)
                         num_pag = i + 1
@@ -502,8 +550,11 @@ def converter_pdf_para_md(caminho_pdf: Path, forcar_ocr: bool = False, idioma: s
                     pagina = leitor.pages[i]
                     texto = (pagina.extract_text() or "").strip()
                     num_pag = i + 1
-                    paginas_ocr.append(num_pag)
-                    tag_tipo = " (OCR Otimizado - OCRmyPDF)"
+                    if forcar_ocr or num_pag in paginas_sem_texto_nativo:
+                        paginas_ocr.append(num_pag)
+                        tag_tipo = " (OCR Otimizado - OCRmyPDF)"
+                    else:
+                        tag_tipo = ""
                 else:
                     texto, usou_ocr = processar_pagina_fallback(pdf_para_leitura, i, leitor, forcar_ocr, idioma)
                     num_pag = i + 1
@@ -563,7 +614,7 @@ def anonimizar_conteudo(corpo_md: str, referencia: str) -> tuple[str, str]:
     para Markdown, preservando a marcação "## Página N". Retorna
     (corpo_anonimizado, chave_de_desanonimizacao_em_markdown).
     """
-    script_anonimizador = MATERIAL_DIR / "scripts" / "pdf_to_md_anonimizado.py"
+    script_anonimizador = BASE_DIR / "scripts" / "pdf_to_md_anonimizado.py"
     if not script_anonimizador.exists():
         # Rede de segurança mínima caso o motor completo não esteja
         # disponível: só os padrões estruturados mais simples, sem chave
@@ -600,7 +651,7 @@ def anonimizar_conteudo(corpo_md: str, referencia: str) -> tuple[str, str]:
 
 
 def gravar_log(data_str: str, texto_log: str):
-    """Grava entrada de log dentro da subpasta diária: 12-conversoes/log/AAAA-MM-DD/."""
+    """Grava entrada de log dentro da subpasta diária: log/AAAA-MM-DD/."""
     pasta_log_dia = LOG_DIR / data_str
     pasta_log_dia.mkdir(parents=True, exist_ok=True)
     arquivo_log = pasta_log_dia / f"conversoes_{data_str}.log"
@@ -671,8 +722,8 @@ TAMANHO ORIGINAL  : {tamanho_legivel} ({tamanho_bytes} bytes)
 TOTAL DE PÁGINAS  : {total_paginas}
 PÁGINAS COM OCR   : {info_ocr}
 HASH SHA-256      : {hash_orig}
-PASTA DE ENTRADA  : material/{modo_chave}/
-PASTA DE DESTINO  : conversoes/{modo_chave}/{data_hoje}/
+PASTA DE ENTRADA  : arquivos_de_entrada/{modo_chave}/
+PASTA DE DESTINO  : arquivos_convertidos/{modo_chave}/{data_hoje}/
 ==============================================================================
 -->
 
@@ -714,7 +765,7 @@ PASTA DE DESTINO  : conversoes/{modo_chave}/{data_hoje}/
     print(f"    - Arquivo original transportado para: {destino_arquivo_orig.relative_to(BASE_DIR)}")
     print(f"    - Markdown gerado com rastreabilidade: {destino_md.relative_to(BASE_DIR)}")
 
-    # 7. Gravação de Log Diário em 12-conversoes/log/AAAA-MM-DD/
+    # 7. Gravação de Log Diário em log/AAAA-MM-DD/
     registro_sucesso = f"""[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [SUCESSO] [MODO: {modo_chave.upper()}]
   Arquivo Original  : {nome_arquivo} ({tamanho_legivel})
   Hash SHA-256      : {hash_orig}
@@ -731,7 +782,7 @@ PASTA DE DESTINO  : conversoes/{modo_chave}/{data_hoje}/
 
 
 def eh_arquivo_chave(caminho: Path) -> bool:
-    """Identifica se um .md em material/desanonimizacao/ é uma chave (e não
+    """Identifica se um .md em arquivos_de_entrada/desanonimizacao/ é uma chave (e não
     o documento anonimizado), pelo prefixo do nome ou, se o nome tiver sido
     alterado, pelo conteúdo do cabeçalho."""
     if caminho.name.lower().startswith(PREFIXO_CHAVE):
@@ -766,7 +817,7 @@ def parear_chave_com_documentos(chave: Path, candidatos: list[Path]) -> list[Pat
     """
     Descobre quais arquivos, dentre os candidatos anexados junto com a
     chave, pertencem a ela — permitindo que vários pares (documento +
-    chave) sejam soltos juntos em material/desanonimizacao/ sem se
+    chave) sejam soltos juntos em arquivos_de_entrada/desanonimizacao/ sem se
     confundirem. Duas estratégias, na ordem:
 
       1) Nome espelhado: 'chave_de_desanonimizacao_<nome>.md' casa com o
@@ -791,11 +842,11 @@ def parear_chave_com_documentos(chave: Path, candidatos: list[Path]) -> list[Pat
 
 def processar_fila_desanonimizacao() -> int:
     """
-    Varre material/desanonimizacao/: para cada chave encontrada, localiza
+    Varre arquivos_de_entrada/desanonimizacao/: para cada chave encontrada, localiza
     o(s) documento(s) anonimizado(s) correspondente(s) entre os arquivos
     anexados, gera o .md revertido (desanonimizado) e move os três
     arquivos (chave, documento original e o gerado) juntos para uma
-    subpasta em conversoes/desanonimizacao/AAAA-MM-DD/.
+    subpasta em arquivos_convertidos/desanonimizacao/AAAA-MM-DD/.
     """
     cfg = MODOS["desanonimizacao"]
     pasta_entrada = cfg["entrada"]
@@ -910,7 +961,7 @@ def varrer_e_processar_filas() -> int:
 def exibir_status():
     """Exibe relatório das filas de conversão atuais e totais processados."""
     print("=" * 75)
-    print(" STATUS DO SISTEMA DE CONVERSÃO LOCAL (12-conversoes)")
+    print(" STATUS DO SISTEMA DE CONVERSÃO LOCAL")
     print("=" * 75)
     for modo_chave, cfg in MODOS.items():
         entrada = cfg["entrada"]
@@ -919,14 +970,14 @@ def exibir_status():
         qtd_pendentes = len([
             p for p in entrada.glob("*") if p.is_file() and p.suffix.lower() in extensoes_modo
         ]) if entrada.exists() else 0
-        total_subpastas_data = len(list(saida.glob("*"))) if saida.exists() else 0
+        total_subpastas_data = len([p for p in saida.glob("*") if p.is_dir() and not p.name.startswith(".")]) if saida.exists() else 0
 
         print(f"Modo: {modo_chave.upper()} ({cfg['descricao']})")
         print(f"  Entrada : {entrada.relative_to(BASE_DIR)} -> {qtd_pendentes} arquivo(s) pendente(s)")
         print(f"  Saída   : {saida.relative_to(BASE_DIR)} -> {total_subpastas_data} lote(s) diário(s)")
         print("-" * 75)
 
-    total_logs = len(list(LOG_DIR.glob("*"))) if LOG_DIR.exists() else 0
+    total_logs = len([p for p in LOG_DIR.glob("*") if p.is_dir() and not p.name.startswith(".")]) if LOG_DIR.exists() else 0
     print(f"Logs Diários: {LOG_DIR.relative_to(BASE_DIR)} -> {total_logs} subpasta(s) diária(s)")
     print("=" * 75)
 
@@ -1011,7 +1062,7 @@ def main():
     else:
         processados = varrer_e_processar_filas()
         if processados == 0:
-            print("Nenhum arquivo pendente nas pastas de entrada (material/padrao, material/ocr, material/anonimizacao).")
+            print("Nenhum arquivo pendente nas pastas de entrada (arquivos_de_entrada/padrao, arquivos_de_entrada/ocr, arquivos_de_entrada/anonimizacao).")
         else:
             print(f"\nProcessamento concluído: {processados} arquivo(s) convertido(s) e transportado(s).")
 

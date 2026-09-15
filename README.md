@@ -21,16 +21,21 @@ página do PDF original cada trecho veio.
 
 - **Extração de texto nativo primeiro.** Se o PDF já tem texto selecionável,
   ele é extraído diretamente — nenhuma imagem é gerada, nenhum OCR roda.
-- **OCR automático como fallback.** Páginas sem texto suficiente (tipicamente
-  páginas escaneadas) são renderizadas como imagem a 300 DPI e processadas
-  pelo Tesseract. Isso acontece por página, então um PDF pode ter páginas
-  digitais e páginas escaneadas misturadas sem problema.
-- **OCR otimizado opcional via OCRmyPDF.** Quando o OCR é forçado em um
-  documento inteiro, o pipeline tenta primeiro o `OCRmyPDF`, que aplica
-  correção de rotação, correção de inclinação (deskew) e limpeza de ruído
-  antes do OCR — melhorando a qualidade em documentos mal escaneados. Se o
-  `OCRmyPDF` não estiver instalado, cai automaticamente para o método manual
-  (renderização a 300 DPI + Tesseract puro).
+- **OCR automático como fallback, com pré-processamento via OCRmyPDF.**
+  Páginas sem texto nativo suficiente (tipicamente páginas escaneadas)
+  passam primeiro pelo `OCRmyPDF` quando disponível — que corrige
+  rotação, corrige inclinação (deskew) e remove ruído de digitalização
+  antes do OCR, resolvendo a maioria dos scans tortos/ruidosos — e só
+  então são processadas pelo Tesseract. Isso acontece por página, então
+  um PDF pode ter páginas digitais e páginas escaneadas misturadas sem
+  problema, e as páginas com texto nativo bom nunca são tocadas (modo
+  híbrido, `--skip-text`). Se o `OCRmyPDF` não estiver instalado, cai
+  automaticamente para o método manual (renderização a 300 DPI +
+  Tesseract puro, sem pré-processamento).
+- **Modo de OCR forçado (Estratégia 2).** No modo `ocr` dedicado (ou com
+  `--forcar-ocr`), o `OCRmyPDF` roda em TODAS as páginas
+  (`--force-ocr`), reprocessando mesmo as que já têm texto nativo — útil
+  quando o texto nativo existente é pouco confiável.
 - **Anonimização automática opcional.** Um motor baseado em regex e
   heurística de nomes próprios detecta e substitui CPF, CNPJ, número de
   processo (padrão CNJ), CEP, e-mail, telefone, RG, endereço, nomes de
@@ -58,9 +63,15 @@ Para cada página: existe texto nativo suficiente (≥ 25 caracteres)?
     sim                                  não
      │                                   │
      ▼                                   ▼
-usa o texto extraído          renderiza a página como imagem (300 DPI)
-     │                         e roda OCR (Tesseract, ou OCRmyPDF quando
-     │                         o OCR é forçado no documento inteiro)
+usa o texto extraído          OCRmyPDF disponível? (deskew + rotação +
+     │                         limpeza de ruído antes do OCR)
+     │                                   │
+     │                          sim ─────┴───── não
+     │                           │               │
+     │                           ▼               ▼
+     │                   pré-processa e faz   renderiza a imagem a
+     │                   OCR na página         300 DPI e roda
+     │                   (Tesseract)           Tesseract puro
      │                                   │
      └───────────────┬───────────────────┘
                       ▼
@@ -78,13 +89,14 @@ OCR. Páginas com texto nativo nunca viram imagem.
 
 ## Estrutura do repositório
 
-As quatro pastas de entrada (`material/padrao/`, `material/ocr/`,
-`material/anonimizacao/` e `material/desanonimizacao/`) **já vêm criadas
-neste repositório** (mantidas no Git por um `.gitkeep`) — basta clonar ou
+As quatro pastas de entrada (`arquivos_de_entrada/padrao/`,
+`arquivos_de_entrada/ocr/`, `arquivos_de_entrada/anonimizacao/` e
+`arquivos_de_entrada/desanonimizacao/`) **já vêm criadas neste
+repositório** (mantidas no Git por um `.gitkeep`) — basta clonar ou
 copiar a pasta inteira para o seu sistema, sem precisar criar nada à mão.
-As pastas de saída (`conversoes/` e `log/`) **não** vêm no repositório:
-o próprio script as cria automaticamente na primeira execução, cada uma
-já com a subpasta do dia (`AAAA-MM-DD`).
+As pastas de saída (`arquivos_convertidos/` e `log/`) **não** vêm no
+repositório: o próprio script as cria automaticamente na primeira
+execução, cada uma já com a subpasta do dia (`AAAA-MM-DD`).
 
 ```
 .
@@ -93,20 +105,20 @@ já com a subpasta do dia (`AAAA-MM-DD`).
 │   ├── pdf_to_md_anonimizado.py  # conversor standalone + anonimização
 │   ├── auto_conversor.py         # pipeline automatizado com filas e rastreabilidade
 │   └── executar_conversor.sh     # atalho de linha de comando para o pipeline
-├── material/                     # pastas de ENTRADA do pipeline automatizado (já criadas)
+├── arquivos_de_entrada/          # pastas de ENTRADA do pipeline automatizado (já criadas)
 │   ├── padrao/                   # PDFs para conversão normal (texto nativo + OCR se preciso)
 │   ├── ocr/                      # PDFs para OCR forçado em todas as páginas
 │   ├── anonimizacao/             # PDFs para conversão com anonimização
 │   └── desanonimizacao/          # documento anonimizado + chave, para reverter
-├── conversoes/                   # pastas de SAÍDA (criadas automaticamente, por data)
+├── arquivos_convertidos/         # pastas de SAÍDA (criadas automaticamente, por data)
 ├── log/                          # logs e progresso (criados automaticamente)
 ├── requirements.txt
 ├── LICENSE
 └── README.md
 ```
 
-A relação é simples: **cada subpasta de `material/` tem uma subpasta
-correspondente em `conversoes/`**, com o mesmo nome. Você solta o arquivo
+A relação é simples: **cada subpasta de `arquivos_de_entrada/` tem uma subpasta
+correspondente em `arquivos_convertidos/`**, com o mesmo nome. Você solta o arquivo
 na pasta de entrada que representa o comportamento que quer (padrão, OCR
 forçado, anonimização, ou desanonimização); o script processa e grava o
 resultado na pasta de saída equivalente, dentro de uma subpasta com a
@@ -124,7 +136,7 @@ para o arquivo e recebe o `.md` na hora.
 ### 2. Pipeline automatizado — `auto_conversor.py`
 
 Para quem converte documentos com frequência. Você solta arquivos nas pastas
-de `material/` e roda o script (ou deixa em modo vigilância contínua); ele
+de `arquivos_de_entrada/` e roda o script (ou deixa em modo vigilância contínua); ele
 processa tudo, organiza a saída por data e mantém log e hash de cada
 conversão.
 
@@ -195,7 +207,7 @@ rótulo → texto original, para conferência e para reverter depois).
 ### Pipeline automatizado
 
 ```bash
-# processa uma vez todos os arquivos pendentes nas pastas de material/
+# processa uma vez todos os arquivos pendentes nas pastas de arquivos_de_entrada/
 python3 scripts/auto_conversor.py
 
 # monitora as pastas continuamente
@@ -218,9 +230,9 @@ Ou usando o atalho:
 ```
 
 Fluxo de trabalho: solte o PDF (ou imagem: `.png`, `.jpg`, `.tiff`, `.bmp`)
-na pasta `material/padrao/`, `material/ocr/` ou `material/anonimizacao/`
+na pasta `arquivos_de_entrada/padrao/`, `arquivos_de_entrada/ocr/` ou `arquivos_de_entrada/anonimizacao/`
 correspondente ao comportamento desejado, rode um dos comandos acima, e
-pegue o `.md` gerado em `conversoes/<modo>/AAAA-MM-DD/`. Para reverter uma
+pegue o `.md` gerado em `arquivos_convertidos/<modo>/AAAA-MM-DD/`. Para reverter uma
 anonimização, veja a seção seguinte.
 
 ## Anonimização de dados pessoais/sigilosos
@@ -257,6 +269,13 @@ documento:
   `Promotor(a)`, `Delegado(a)` etc.). Uma lista extensa de termos jurídicos e
   institucionais (ex.: "Ministério Público", "Poder Judiciário", "Boletim de
   Ocorrência") é usada para não confundir esses termos com nomes próprios.
+- Campos de formulário/BO já rotulados como pessoais ("Filiação:", "Nome
+  da Mãe:", "Nome do Pai:", "Genitor(a):" etc.) são mascarados com uma
+  regra mais tolerante: como o próprio rótulo do campo já garante que
+  aquilo é nome de pessoa, um fragmento de uma única palavra também é
+  mascarado — importante quando o OCR degrada o nome (scan ruim,
+  caractere trocado) e a heurística genérica de 2+ palavras não seria
+  suficiente para reconhecê-lo.
 
 ### Dois arquivos de saída
 
@@ -302,7 +321,7 @@ julgamento humano sobre o que precisa ficar oculto.
 
 O pipeline automatizado reverte uma anonimização sozinho: basta soltar o
 documento anonimizado **junto com a sua chave** na pasta
-`material/desanonimizacao/` e rodar o pipeline normalmente
+`arquivos_de_entrada/desanonimizacao/` e rodar o pipeline normalmente
 (`python3 scripts/auto_conversor.py` ou `./scripts/executar_conversor.sh`).
 
 ### Como o pareamento funciona
@@ -327,11 +346,11 @@ esteja presente, e um aviso é impresso indicando o que falta.
 ### Saída gerada
 
 Para cada par reconhecido, o script cria uma pasta em
-`conversoes/desanonimizacao/AAAA-MM-DD/<nome-do-documento>/` contendo os
+`arquivos_convertidos/desanonimizacao/AAAA-MM-DD/<nome-do-documento>/` contendo os
 três arquivos juntos:
 
 ```
-conversoes/desanonimizacao/2026-09-13/processo123/
+arquivos_convertidos/desanonimizacao/2026-09-13/processo123/
 ├── processo123.md                              # documento anonimizado (movido da entrada)
 ├── chave_de_desanonimizacao_processo123.md     # chave usada (movida da entrada)
 └── desanonimizado_processo123.md               # texto já revertido/preenchido

@@ -34,7 +34,11 @@ Dependências (ver LEIA-ME.md para instruções passo a passo):
 """
 
 import argparse
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 MIN_CHARS_TEXTO_NATIVO = 25  # abaixo disso, consideramos a página "sem texto útil" -> OCR
@@ -65,40 +69,126 @@ def ocr_pagina(caminho_pdf, numero_pagina, idioma):
     return texto.strip()
 
 
+def _obter_executavel_ocrmypdf():
+    """Detecta o executável do OCRmyPDF no PATH, via Snap, ou como módulo Python."""
+    bin_path = shutil.which("ocrmypdf")
+    if bin_path:
+        return [bin_path]
+    if sys.platform != "win32" and Path("/snap/bin/ocrmypdf").exists():
+        return ["/snap/bin/ocrmypdf"]
+    try:
+        res = subprocess.run(
+            [sys.executable, "-m", "ocrmypdf", "--version"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if res.returncode == 0:
+            return [sys.executable, "-m", "ocrmypdf"]
+    except Exception:
+        pass
+    return None
+
+
+def _pre_processar_com_ocrmypdf(caminho_pdf: Path, pdf_saida: Path, idioma: str, forcar_ocr: bool, verbose=True) -> bool:
+    """
+    Pré-processa o PDF com OCRmyPDF (deskew + rotação automática + limpeza
+    de ruído) antes da extração de texto. Sem isso, o OCR de fallback
+    (Tesseract cru, sem pré-processamento) falha silenciosamente ou produz
+    texto incompleto em páginas escaneadas tortas/rotacionadas/ruidosas —
+    exatamente o cenário de "várias páginas deram erro" em BOs e autos
+    policiais fotocopiados/escaneados em lote.
+
+    forcar_ocr=False usa --skip-text (modo híbrido: preserva texto nativo
+    já bom, só aplica deskew/limpeza + OCR nas páginas sem texto) —
+    apropriado para o uso normal deste script (padrão/anonimização).
+    forcar_ocr=True usa --force-ocr (reprocessa tudo via OCR).
+    """
+    cmd_base = _obter_executavel_ocrmypdf()
+    if not cmd_base:
+        return False
+    cmd = cmd_base + [
+        "-l", idioma,
+        "--rotate-pages",
+        "--deskew",
+        "--clean",
+        "--force-ocr" if forcar_ocr else "--skip-text",
+        "--jobs", "0",
+        str(caminho_pdf),
+        str(pdf_saida),
+    ]
+    if verbose:
+        print("  Pré-processando com OCRmyPDF (rotação, deskew, limpeza de ruído)...")
+    try:
+        resultado = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if resultado.returncode == 0 and pdf_saida.exists() and pdf_saida.stat().st_size > 0:
+            return True
+        if verbose:
+            print(f"  [aviso] OCRmyPDF retornou código {resultado.returncode}. Usando fallback página a página.", file=sys.stderr)
+        return False
+    except Exception as e:
+        if verbose:
+            print(f"  [aviso] Falha ao executar OCRmyPDF: {e}. Usando fallback página a página.", file=sys.stderr)
+        return False
+
+
 def converter_pdf(caminho_pdf: Path, caminho_saida: Path, forcar_ocr: bool, idioma: str, verbose=True):
     from pypdf import PdfReader
 
     leitor = PdfReader(str(caminho_pdf))
     total_paginas = len(leitor.pages)
 
-    blocos = []
-    paginas_com_ocr = []
+    # Marca de antemão quais páginas não têm texto nativo suficiente — só
+    # para rotular corretamente quais páginas passaram por OCR no modo
+    # híbrido do OCRmyPDF (ele não reporta isso página a página).
+    paginas_sem_texto_nativo = set()
+    if not forcar_ocr:
+        for i, pagina in enumerate(leitor.pages, start=1):
+            if len(extrair_texto_nativo(pagina)) < MIN_CHARS_TEXTO_NATIVO:
+                paginas_sem_texto_nativo.add(i)
 
-    for i, pagina in enumerate(leitor.pages, start=1):
-        texto = "" if forcar_ocr else extrair_texto_nativo(pagina)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pdf_to_md_ocrmypdf_"))
+    pdf_temp = tmp_dir / f"processado_{int(time.time() * 1000)}.pdf"
+    sucesso_ocrmypdf = False
+    try:
+        sucesso_ocrmypdf = _pre_processar_com_ocrmypdf(caminho_pdf, pdf_temp, idioma, forcar_ocr, verbose=verbose)
+        if sucesso_ocrmypdf:
+            leitor = PdfReader(str(pdf_temp))
+            total_paginas = len(leitor.pages)
 
-        usado_ocr = False
-        if len(texto) < MIN_CHARS_TEXTO_NATIVO:
-            try:
-                texto_ocr = ocr_pagina(caminho_pdf, i, idioma)
-                if len(texto_ocr) > len(texto):
-                    texto = texto_ocr
+        blocos = []
+        paginas_com_ocr = []
+
+        for i, pagina in enumerate(leitor.pages, start=1):
+            usado_ocr = False
+
+            if sucesso_ocrmypdf:
+                texto = extrair_texto_nativo(pagina)
+                if forcar_ocr or i in paginas_sem_texto_nativo:
                     usado_ocr = True
-            except Exception as e:
-                if verbose:
-                    print(f"  [aviso] OCR falhou na página {i}: {e}", file=sys.stderr)
+            else:
+                texto = "" if forcar_ocr else extrair_texto_nativo(pagina)
+                if len(texto) < MIN_CHARS_TEXTO_NATIVO:
+                    try:
+                        texto_ocr = ocr_pagina(caminho_pdf, i, idioma)
+                        if len(texto_ocr) > len(texto):
+                            texto = texto_ocr
+                            usado_ocr = True
+                    except Exception as e:
+                        if verbose:
+                            print(f"  [aviso] OCR falhou na página {i}: {e}", file=sys.stderr)
 
-        if usado_ocr:
-            paginas_com_ocr.append(i)
+            if usado_ocr:
+                paginas_com_ocr.append(i)
 
-        if not texto:
-            texto = "*(nenhum texto extraído nesta página)*"
+            if not texto:
+                texto = "*(nenhum texto extraído nesta página)*"
 
-        blocos.append(f"## Página {i}\n\n{texto}\n")
+            blocos.append(f"## Página {i}\n\n{texto}\n")
 
-        if verbose:
-            marca = "OCR" if usado_ocr else "texto nativo"
-            print(f"  página {i}/{total_paginas} ({marca}) — {len(texto)} caracteres")
+            if verbose:
+                marca = "OCR" if usado_ocr else "texto nativo"
+                print(f"  página {i}/{total_paginas} ({marca}) — {len(texto)} caracteres")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     cabecalho = f"<!-- Convertido de: {caminho_pdf.name} | {total_paginas} páginas -->\n\n"
     conteudo_final = cabecalho + "\n---\n\n".join(blocos)

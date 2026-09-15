@@ -38,7 +38,7 @@ arquivo nem de nenhum dado pessoal — dois PDFs diferentes praticamente
 nunca geram o mesmo código, mas o mesmo PDF processado de novo gera
 sempre o mesmo código (útil para saber se já foi convertido antes, e é
 também o que permite ao `auto_conversor.py` casar automaticamente um
-documento anonimizado com a sua chave em `material/desanonimizacao/`).
+documento anonimizado com a sua chave em `arquivos_de_entrada/desanonimizacao/`).
 
 IMPORTANTE — LEIA COM ATENÇÃO:
     A detecção de dados a anonimizar é feita por padrões (regex) e por
@@ -71,7 +71,11 @@ IMPORTANTE — LEIA COM ATENÇÃO:
 import argparse
 import hashlib
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 import unicodedata
 from collections import OrderedDict
 from datetime import datetime
@@ -108,41 +112,133 @@ def ocr_pagina(caminho_pdf, numero_pagina, idioma):
     return texto.strip()
 
 
+def _obter_executavel_ocrmypdf():
+    """Detecta o executável do OCRmyPDF no PATH, via Snap, ou como módulo Python."""
+    bin_path = shutil.which("ocrmypdf")
+    if bin_path:
+        return [bin_path]
+    if sys.platform != "win32" and Path("/snap/bin/ocrmypdf").exists():
+        return ["/snap/bin/ocrmypdf"]
+    try:
+        res = subprocess.run(
+            [sys.executable, "-m", "ocrmypdf", "--version"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if res.returncode == 0:
+            return [sys.executable, "-m", "ocrmypdf"]
+    except Exception:
+        pass
+    return None
+
+
+def _pre_processar_com_ocrmypdf(caminho_pdf: Path, pdf_saida: Path, idioma: str, forcar_ocr: bool, verbose=True) -> bool:
+    """
+    Pré-processa o PDF com OCRmyPDF (deskew + rotação automática + limpeza
+    de ruído) antes da extração de texto. Sem isso, o OCR de fallback
+    (Tesseract cru, sem pré-processamento) falha silenciosamente ou produz
+    texto incompleto/corrompido em páginas escaneadas tortas, rotacionadas
+    ou ruidosas — a causa raiz tanto de páginas "em branco"/com erro quanto
+    de dados pessoais (ex.: nome de mãe/pai no campo "Filiação") não
+    detectados pela anonimização, já que o motor de anonimização não
+    consegue mascarar o que o OCR nunca extraiu corretamente.
+
+    forcar_ocr=False usa --skip-text (modo híbrido: preserva o texto
+    nativo já bom das páginas digitais e só aplica deskew/limpeza + OCR
+    nas páginas sem texto) — é o modo usado normalmente por este script.
+    forcar_ocr=True usa --force-ocr (reprocessa todas as páginas via OCR).
+    """
+    cmd_base = _obter_executavel_ocrmypdf()
+    if not cmd_base:
+        return False
+    cmd = cmd_base + [
+        "-l", idioma,
+        "--rotate-pages",
+        "--deskew",
+        "--clean",
+        "--force-ocr" if forcar_ocr else "--skip-text",
+        "--jobs", "0",
+        str(caminho_pdf),
+        str(pdf_saida),
+    ]
+    if verbose:
+        print("  Pré-processando com OCRmyPDF (rotação, deskew, limpeza de ruído)...")
+    try:
+        resultado = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if resultado.returncode == 0 and pdf_saida.exists() and pdf_saida.stat().st_size > 0:
+            return True
+        if verbose:
+            print(f"  [aviso] OCRmyPDF retornou código {resultado.returncode}. Usando fallback página a página.", file=sys.stderr)
+        return False
+    except Exception as e:
+        if verbose:
+            print(f"  [aviso] Falha ao executar OCRmyPDF: {e}. Usando fallback página a página.", file=sys.stderr)
+        return False
+
+
 def extrair_paginas(caminho_pdf: Path, forcar_ocr: bool, idioma: str, verbose=True):
-    """Retorna lista de (numero_pagina, texto) e lista de páginas que usaram OCR."""
+    """Retorna lista de (numero_pagina, texto) e lista de páginas que usaram OCR.
+
+    Tenta primeiro o pré-processamento com OCRmyPDF (deskew/rotação/limpeza
+    — ver _pre_processar_com_ocrmypdf); só cai no OCR página a página via
+    Tesseract cru (sem pré-processamento) se o OCRmyPDF não estiver
+    disponível ou falhar.
+    """
     from pypdf import PdfReader
 
     leitor = PdfReader(str(caminho_pdf))
     total_paginas = len(leitor.pages)
 
-    paginas = []
-    paginas_com_ocr = []
+    paginas_sem_texto_nativo = set()
+    if not forcar_ocr:
+        for i, pagina in enumerate(leitor.pages, start=1):
+            if len(extrair_texto_nativo(pagina)) < MIN_CHARS_TEXTO_NATIVO:
+                paginas_sem_texto_nativo.add(i)
 
-    for i, pagina in enumerate(leitor.pages, start=1):
-        texto = "" if forcar_ocr else extrair_texto_nativo(pagina)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pdf_to_md_anon_ocrmypdf_"))
+    pdf_temp = tmp_dir / f"processado_{int(time.time() * 1000)}.pdf"
+    sucesso_ocrmypdf = False
 
-        usado_ocr = False
-        if len(texto) < MIN_CHARS_TEXTO_NATIVO:
-            try:
-                texto_ocr = ocr_pagina(caminho_pdf, i, idioma)
-                if len(texto_ocr) > len(texto):
-                    texto = texto_ocr
+    try:
+        sucesso_ocrmypdf = _pre_processar_com_ocrmypdf(caminho_pdf, pdf_temp, idioma, forcar_ocr, verbose=verbose)
+        if sucesso_ocrmypdf:
+            leitor = PdfReader(str(pdf_temp))
+            total_paginas = len(leitor.pages)
+
+        paginas = []
+        paginas_com_ocr = []
+
+        for i, pagina in enumerate(leitor.pages, start=1):
+            usado_ocr = False
+
+            if sucesso_ocrmypdf:
+                texto = extrair_texto_nativo(pagina)
+                if forcar_ocr or i in paginas_sem_texto_nativo:
                     usado_ocr = True
-            except Exception as e:
-                if verbose:
-                    print(f"  [aviso] OCR falhou na página {i}: {e}", file=sys.stderr)
+            else:
+                texto = "" if forcar_ocr else extrair_texto_nativo(pagina)
+                if len(texto) < MIN_CHARS_TEXTO_NATIVO:
+                    try:
+                        texto_ocr = ocr_pagina(caminho_pdf, i, idioma)
+                        if len(texto_ocr) > len(texto):
+                            texto = texto_ocr
+                            usado_ocr = True
+                    except Exception as e:
+                        if verbose:
+                            print(f"  [aviso] OCR falhou na página {i}: {e}", file=sys.stderr)
 
-        if usado_ocr:
-            paginas_com_ocr.append(i)
+            if usado_ocr:
+                paginas_com_ocr.append(i)
 
-        if not texto:
-            texto = ""
+            if not texto:
+                texto = ""
 
-        paginas.append((i, texto))
+            paginas.append((i, texto))
 
-        if verbose:
-            marca = "OCR" if usado_ocr else "texto nativo"
-            print(f"  página {i}/{total_paginas} ({marca}) — {len(texto)} caracteres")
+            if verbose:
+                marca = "OCR" if usado_ocr else "texto nativo"
+                print(f"  página {i}/{total_paginas} ({marca}) — {len(texto)} caracteres")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return paginas, paginas_com_ocr, total_paginas
 
@@ -450,6 +546,41 @@ RE_BLOCO_CAIXA_ALTA = re.compile(
 
 RE_TITULO_NOME = re.compile(TITULOS_PESSOA + r"\.?\s+" + RE_BLOCO_MAIUSCULO.pattern)
 
+# Rótulos de campos de formulário/BO/processo que, por definição, só podem
+# conter nome de pessoa como valor. Diferente da heurística genérica acima
+# (que exige 2+ palavras capitalizadas para evitar falso positivo), aqui o
+# próprio rótulo já garante que o valor é um nome — então é seguro mascarar
+# mesmo um fragmento de 1 palavra, o que é essencial quando o OCR degrada o
+# texto (ruído, foto torta, baixa resolução) e só sobra um pedaço legível do
+# nome. Esta é a correção direta para o caso relatado de nome de pai/mãe
+# vazando na anonimização: o campo "Filiação" era detectado, mas o nome
+# depois dele só era mascarado se batesse no padrão genérico de 2+ palavras
+# "limpas" — um nome truncado ou com caractere trocado pelo OCR (ex.:
+# "M4RIA", ou apenas "SILVA" sobrando de um nome maior) passava direto.
+RE_CAMPO_PESSOAL = re.compile(
+    r"\b(Filia[çc][ãa]o|Nome\s+d[ao]\s+M[ãa]e|Nome\s+d[oa]\s+Pai|"
+    r"Genitor(?:a)?|Nome\s+d[ao]\s+Genitor(?:a)?|Nome\s+d[ao]\s+Declarante|"
+    r"Nome\s+d[ao]\s+Testemunha|Nome\s+d[ao]\s+V[íi]tima|Nome\s+d[ao]\s+Autor(?:a)?|"
+    r"Nome\s+d[ao]\s+Ofendid[ao]|Nome\s+Completo|Nome\s+Social)"
+    r"(\s*[:\-]\s*)([^\n]{1,140})",
+    re.IGNORECASE,
+)
+
+# Valores que, mesmo aparecendo como conteúdo de um campo pessoal, NÃO são
+# nome de ninguém e não devem virar um rótulo "nome_N" (isso poluiria a
+# chave de desanonimização com entradas falsas e sem utilidade).
+PLACEHOLDERS_NEGATIVOS = {
+    "NAO INFORMADO", "NAO INFORMADA", "IGNORADO", "IGNORADA", "NAO CONSTA",
+    "N/A", "NA", "NI", "N/I", "SEM INFORMACAO", "NAO DECLARADO",
+    "NAO DECLARADA", "PREJUDICADO", "PREJUDICADA", "DESCONHECIDO",
+    "DESCONHECIDA", "FALECIDO", "FALECIDA", "NAO SABE",
+    "NAO SOUBE INFORMAR", "EM BRANCO", "NAO SE APLICA", "AUSENTE",
+}
+
+# Separa dois nomes dentro do mesmo campo (comum em "Filiação: Mãe e Pai"),
+# preservando o separador original na saída (vírgula, barra ou "e"/"E").
+RE_SEPARADOR_NOME_CAMPO = re.compile(r"(,|;|/|\bE\b)", re.IGNORECASE)
+
 
 def _normalizar(palavra: str) -> str:
     return _remover_acentos(palavra).upper().strip(".,;:")
@@ -463,13 +594,21 @@ def _e_titulo(palavra: str) -> bool:
     return _normalizar(palavra) in TITULOS_A_DESCARTAR
 
 
-def _extrair_nucleo_nome(bloco: str):
+def _extrair_nucleo_nome(bloco: str, min_palavras: int = 2):
     """
     Recebe um bloco bruto (ex.: "MM Juiz Carlos Eduardo Ramos" ou
     "Defensor Público Marcos Vinicius Oliveira") e devolve (inicio, fim,
     nucleo) delimitando, dentro do bloco, a maior subsequência contígua de
     palavras que NÃO são título nem stopword jurídica/institucional — ou
-    None se não houver um núcleo de 2+ palavras válido.
+    None se não houver um núcleo de `min_palavras`+ palavras válido.
+
+    `min_palavras` é 2 por padrão (heurística genérica, para evitar falso
+    positivo sobre uma palavra capitalizada solta em qualquer lugar do
+    texto). Em contexto já identificado como campo de dado pessoal (ex.:
+    valor de um rótulo "Filiação:"/"Nome da Mãe:") usa-se min_palavras=1,
+    pois ali o rótulo já garante que se trata de nome de pessoa — inclusive
+    quando o OCR degradou o texto e só restou um fragmento de uma palavra
+    (ex.: um dos dois nomes truncado/ilegível pelo scanner).
 
     Isso resolve dois problemas ao mesmo tempo:
       - títulos/cargos (Dr., MM. Juiz, Defensor Público...) ficam de fora
@@ -519,7 +658,7 @@ def _extrair_nucleo_nome(bloco: str):
         melhor = melhor[:-1]
 
     palavras_relevantes = [t for t in melhor if relevante(t)]
-    if len(palavras_relevantes) < 2:
+    if len(palavras_relevantes) < min_palavras:
         return None
 
     # Nomes reais de pessoa raramente passam de ~6 palavras (nome +
@@ -611,9 +750,56 @@ class MotorAnonimizacao:
     def _registrar_ocorrencia(self, rotulo: str, pagina: int):
         self.registro[rotulo]["paginas"].add(pagina)
 
+    def _mascarar_valor_campo_pessoal(self, valor: str, numero_pagina: int) -> str:
+        """
+        Mascara o valor de um campo já identificado como pessoal (ver
+        RE_CAMPO_PESSOAL) segmento a segmento (dividindo por vírgula, barra
+        ou "e"/"E", pois um mesmo campo pode trazer dois nomes — ex.: mãe e
+        pai). Usa min_palavras=1 (diferente da heurística genérica), porque
+        o rótulo do campo já garante que aquilo é nome de pessoa, mesmo que
+        o OCR tenha degradado o texto a ponto de sobrar só um fragmento.
+        """
+        partes = RE_SEPARADOR_NOME_CAMPO.split(valor)
+        saida = []
+        for parte in partes:
+            if RE_SEPARADOR_NOME_CAMPO.fullmatch(parte or ""):
+                saida.append(parte)
+                continue
+            segmento = parte
+            if not segmento or not segmento.strip():
+                saida.append(segmento)
+                continue
+            if _normalizar(segmento) in PLACEHOLDERS_NEGATIVOS:
+                saida.append(segmento)
+                continue
+            resultado = _extrair_nucleo_nome(segmento, min_palavras=1)
+            if resultado is None:
+                saida.append(segmento)
+                continue
+            inicio, fim, nucleo = resultado
+            rotulo = self._obter_rotulo("nome", nucleo)
+            self._registrar_ocorrencia(rotulo, numero_pagina)
+            saida.append(f"{segmento[:inicio]}[{rotulo}]{segmento[fim:]}")
+        return "".join(saida)
+
+    def _mascarar_campos_pessoais(self, texto: str, numero_pagina: int) -> str:
+        def _sub_campo(m):
+            rotulo_campo, separador, valor = m.group(1), m.group(2), m.group(3)
+            valor_mascarado = self._mascarar_valor_campo_pessoal(valor, numero_pagina)
+            return f"{rotulo_campo}{separador}{valor_mascarado}"
+
+        return RE_CAMPO_PESSOAL.sub(_sub_campo, texto)
+
     def processar_pagina(self, texto: str, numero_pagina: int) -> str:
         if not texto:
             return texto
+
+        # 0) Campos rotulados que só podem conter nome de pessoa (Filiação,
+        #    Nome da Mãe/Pai, etc.) — roda ANTES da heurística genérica,
+        #    com tolerância a fragmentos de 1 palavra (ver
+        #    _mascarar_valor_campo_pessoal). Preenche a lacuna que permitia
+        #    nome de pai/mãe vazar quando o OCR truncava/corrompia o nome.
+        texto = self._mascarar_campos_pessoais(texto, numero_pagina)
 
         # 1) Categorias estruturadas via regex (CPF, CNPJ, processo, etc.)
         for categoria, padrao in self.CATEGORIAS_REGEX:
@@ -685,10 +871,10 @@ class MotorAnonimizacao:
             "",
             "Para reverter a anonimização automaticamente, salve este arquivo junto",
             "com o `.md` anonimizado correspondente na pasta",
-            "`material/desanonimizacao/` do pipeline automatizado",
+            "`arquivos_de_entrada/desanonimizacao/` do pipeline automatizado",
             "(`auto_conversor.py`). O script identifica sozinho qual chave pertence",
             "a qual documento (mesmo com vários pares anexados de uma vez) e gera",
-            "o arquivo já revertido em `conversoes/desanonimizacao/`.",
+            "o arquivo já revertido em `arquivos_convertidos/desanonimizacao/`.",
             "",
             "Gerado automaticamente por heurística (ver observações de limitação no",
             "topo do script `pdf_to_md_anonimizado.py`). Revise antes de considerar",
