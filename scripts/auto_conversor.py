@@ -3,10 +3,10 @@
 auto_conversor.py — Sistema Automatizado de Conversão de Documentos (PDF/Imagens para Markdown)
 com Rastreabilidade e Suporte a OCR e Anonimização Forense (Res. CNJ nº 615/2025).
 
-Copyright (c) 2026 domingossouzalima-dev
-Licenciado sob a licença MIT. Veja o arquivo LICENSE na raiz do repositório.
+Copyright (C) 2026 Domingos José de Souza Lima Júnior
 
-ESTRUTURA DE DIRETÓRIOS OPERADOS (caminhos relativos à raiz do repositório):
+ESTRUTURA DE DIRETÓRIOS OPERADOS (relativa à raiz do projeto, um nível
+acima da pasta `scripts/` onde este arquivo mora):
   Entrada:
     - arquivos_de_entrada/padrao/          -> Conversão com texto nativo e fallback OCR
     - arquivos_de_entrada/ocr/             -> Conversão com OCR FORÇADO em todas as páginas
@@ -48,7 +48,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageDraw
 import pytesseract
 
 # Importação condicional de motores PDF de alta performance
@@ -76,7 +76,7 @@ except ImportError:
 
 # Diretórios base dinâmicos (compatíveis com Linux e Windows)
 SCRIPT_DIR = Path(__file__).resolve().parent
-BASE_DIR = SCRIPT_DIR.parent  # raiz do repositório
+BASE_DIR = SCRIPT_DIR.parent  # raiz do projeto (.../12-conversoes-pdf-md)
 ENTRADA_DIR = BASE_DIR / "arquivos_de_entrada"
 SAIDA_DIR = BASE_DIR / "arquivos_convertidos"
 LOG_DIR = BASE_DIR / "log"
@@ -192,34 +192,176 @@ def obter_destino_unico(pasta_destino: Path, nome_arquivo: str) -> Path:
     return destino
 
 
-def ocr_imagem_pil(imagem: Image.Image, idioma: str = "por") -> str:
-    """Executa OCR sobre um objeto PIL Image."""
+RE_TARJA_TRIBUNAL = re.compile(
+    r"(?:Este documento é cópia do original assinado digitalmente|"
+    r"Para conferir o original, acesse o site|"
+    r"assinado digitalmente por|"
+    r"Documento assinado eletronicamente|"
+    r"Assinado eletronicamente por|"
+    r"fls\.\s*\d+|"
+    r"Num\.\s*\d+\s*-\s*Pág|"
+    r"código\s+[0-9A-Za-z]{6,})",
+    re.IGNORECASE
+)
+
+
+def pagina_precisa_ocr(texto_nativo: str, tem_imagens: bool = True) -> bool:
+    """Avalia se uma página precisa de OCR, descontando tarjas vetoriais forenses (SAJ/PJe)."""
+    if not texto_nativo:
+        return True
+    linhas_sem_tarja = [
+        l for l in texto_nativo.splitlines() 
+        if not RE_TARJA_TRIBUNAL.search(l)
+    ]
+    texto_util = " ".join(linhas_sem_tarja).strip()
+    chars_alfanumericos = re.sub(r"\W+", "", texto_util)
+    if len(chars_alfanumericos) < MIN_CHARS_TEXTO_NATIVO:
+        return True
+    return False
+
+
+def mascarar_bordas_carimbo(imagem: Image.Image) -> Image.Image:
+    """Mascara margens laterais onde residem tarjas verticais do e-SAJ (borda direita a partir de 93%)."""
+    w, h = imagem.size
+    x_direita = int(w * 0.930)
+    draw = ImageDraw.Draw(imagem)
+    draw.rectangle([x_direita, 0, w, h], fill="white")
+    return imagem
+
+
+def remover_linhas_tabela(imagem_bin: Image.Image) -> Image.Image:
+    """Remove linhas horizontais finas (réguas de formulários e tabelas) que causam alucinações no OCR."""
+    img = imagem_bin.copy()
+    w, h = img.size
+    pix = img.load()
+    for y in range(2, h - 2):
+        consecutivos = 0
+        for x in range(w):
+            if pix[x, y] == 0:
+                consecutivos += 1
+            else:
+                if consecutivos > 80:
+                    for xl in range(x - consecutivos, x):
+                        if pix[xl, y - 2] == 255 and pix[xl, y + 2] == 255:
+                            pix[xl, y] = 255
+                            pix[xl, y - 1] = 255
+                            pix[xl, y + 1] = 255
+                consecutivos = 0
+    return img
+
+
+def eh_linha_ruido(linha: str) -> bool:
+    """Detecta linhas espúrias formadas por traços divisórios, réguas ou ruído gráfico no OCR."""
+    s = linha.strip()
+    if not s:
+        return False
+    # Linha contendo apenas pontuação, traços, underlines, cruzes etc.
+    if re.match(r"^[\s\-_=—–+*~.:;,\'\"/\\|<>ºª§°¬!@#\$%\^&\[\]\(\)\{\}\?]+$", s):
+        return True
+    tokens = s.split()
+    if not tokens:
+        return False
+    # Sequência de caracteres isolados (ex: 'e ++ d A 6 E') gerada por linhas divisórias
+    if len(tokens) >= 3 and all(len(t) <= 2 for t in tokens):
+        if not re.search(r"\b(art|inc|lei|nº|no|fls|pág)\b", s, re.I):
+            return True
+    # Predomínio esmagador de tokens de 1 a 2 caracteres dispersos
+    tokens_curtos = [t for t in tokens if len(t) <= 2]
+    if len(tokens) >= 4 and len(tokens_curtos) / len(tokens) >= 0.8:
+        if not re.search(r"\b(de|do|da|em|ao|às|no|na|art|lei)\b", s, re.I):
+            return True
+    return False
+
+
+def limpar_ruido_ocr(texto: str) -> str:
+    """Elimina blocos de linhas órfãs e artefatos de digitalização no Markdown."""
+    linhas = texto.splitlines()
+    linhas_filtradas = []
+    i = 0
+    n = len(linhas)
+    while i < n:
+        l = linhas[i].strip()
+        if not l:
+            linhas_filtradas.append(linhas[i])
+            i += 1
+            continue
+        # Linha identificada como ruído de formulário/régua
+        if eh_linha_ruido(l):
+            i += 1
+            continue
+        # Bloco de linhas com caracteres órfãos
+        if len(l) <= 3:
+            j = i
+            while j < n and (len(linhas[j].strip()) <= 3):
+                j += 1
+            orfas = [linhas[k].strip() for k in range(i, j) if linhas[k].strip()]
+            if len(orfas) >= 3:
+                i = j
+                continue
+            else:
+                for k in range(i, j):
+                    if not eh_linha_ruido(linhas[k]):
+                        linhas_filtradas.append(linhas[k])
+                i = j
+        else:
+            linhas_filtradas.append(linhas[i])
+            i += 1
+
+    texto_limpo = "\n".join(linhas_filtradas)
+    texto_limpo = re.sub(r"\n{3,}", "\n\n", texto_limpo)
+    return texto_limpo.strip()
+
+
+def ocr_imagem_pil(imagem: Image.Image, idioma: str = "por", aplicar_mascara: bool = True) -> str:
+    """Executa OCR sobre um objeto PIL Image com binarização, remoção de réguas e limpeza de ruído."""
     try:
-        texto = pytesseract.image_to_string(imagem, lang=idioma)
-        return texto.strip()
+        img_proc = imagem.copy()
+        if aplicar_mascara:
+            img_proc = mascarar_bordas_carimbo(img_proc)
+        if img_proc.mode != "L":
+            img_proc = img_proc.convert("L")
+
+        # Binarização com threshold para realce de formulários desbotados
+        threshold = 175
+        bin_img = img_proc.point(lambda p: 255 if p > threshold else 0)
+        # Remove réguas e traços de tabelas que geram alucinações de caracteres
+        bin_img = remover_linhas_tabela(bin_img)
+
+        config_tess = "--psm 3 -c preserve_interword_spaces=1"
+        texto = pytesseract.image_to_string(bin_img, lang=idioma, config=config_tess)
+        return limpar_ruido_ocr(texto.strip())
     except Exception as e:
         print(f"    [erro ocr] Falha no Tesseract: {e}", file=sys.stderr)
         return ""
 
 
 def processar_pagina_pymupdf(doc, i: int, forcar_ocr: bool, idioma: str = "por") -> tuple[str, bool]:
-    """Extrai texto da página via PyMuPDF com renderização de imagem para OCR."""
+    """Extrai texto da página via PyMuPDF com detecção inteligente e OCR otimizado."""
     pagina = doc[i]
-    texto = ""
+    texto_nativo = pagina.get_text("text").strip()
+    tem_imagens = len(pagina.get_images()) > 0
+    precisa_ocr = pagina_precisa_ocr(texto_nativo, tem_imagens)
+
     usou_ocr = False
+    texto = texto_nativo
 
-    if not forcar_ocr:
-        texto = pagina.get_text("text").strip()
+    # Se forcar_ocr for True, preserva texto nativo caso a página tenha conteúdo digital rico (>150 chars úteis).
+    # Caso contrário (documento escaneado), executa OCR com máscara.
+    if forcar_ocr:
+        linhas_sem_tarja = [l for l in texto_nativo.splitlines() if not RE_TARJA_TRIBUNAL.search(l)]
+        chars_uteis = len(re.sub(r"\W+", "", " ".join(linhas_sem_tarja)))
+        executar_ocr = precisa_ocr or chars_uteis < 150
+    else:
+        executar_ocr = precisa_ocr
 
-    if forcar_ocr or len(texto) < MIN_CHARS_TEXTO_NATIVO:
+    if executar_ocr:
         try:
-            # Renderização com matriz 300 DPI (300 / 72 ≈ 4.166)
             zoom = 300 / 72
             matriz = fitz.Matrix(zoom, zoom)
             pix = pagina.get_pixmap(matrix=matriz, alpha=False)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
-            texto_ocr = ocr_imagem_pil(img, idioma)
-            if forcar_ocr or len(texto_ocr) > len(texto):
+            texto_ocr = ocr_imagem_pil(img, idioma, aplicar_mascara=True)
+            if texto_ocr:
                 texto = texto_ocr
                 usou_ocr = True
         except Exception as e:
@@ -229,28 +371,37 @@ def processar_pagina_pymupdf(doc, i: int, forcar_ocr: bool, idioma: str = "por")
 
 
 def processar_pagina_fallback(caminho_pdf: Path, i: int, leitor_pypdf, forcar_ocr: bool, idioma: str = "por") -> tuple[str, bool]:
-    """Fallback usando pypdf e pdf2image caso PyMuPDF não esteja disponível."""
-    texto = ""
+    """Fallback usando pypdf e pdf2image com detecção inteligente e máscara de margens."""
+    texto_nativo = ""
     usou_ocr = False
     pagina = leitor_pypdf.pages[i]
 
-    if not forcar_ocr:
-        try:
-            texto = (pagina.extract_text() or "").strip()
-        except Exception:
-            texto = ""
+    try:
+        texto_nativo = (pagina.extract_text() or "").strip()
+    except Exception:
+        texto_nativo = ""
 
-    if forcar_ocr or len(texto) < MIN_CHARS_TEXTO_NATIVO:
-        if TEM_PDF2IMAGE:
-            try:
-                imagens = convert_from_path(str(caminho_pdf), dpi=300, first_page=i+1, last_page=i+1)
-                if imagens:
-                    texto_ocr = ocr_imagem_pil(imagens[0], idioma)
-                    if forcar_ocr or len(texto_ocr) > len(texto):
-                        texto = texto_ocr
-                        usou_ocr = True
-            except Exception as e:
-                print(f"    [aviso] Falha no fallback pdf2image na página {i+1}: {e}", file=sys.stderr)
+    tem_imagens = hasattr(pagina, "images") and len(pagina.images) > 0
+    precisa_ocr = pagina_precisa_ocr(texto_nativo, tem_imagens)
+    texto = texto_nativo
+
+    if forcar_ocr:
+        linhas_sem_tarja = [l for l in texto_nativo.splitlines() if not RE_TARJA_TRIBUNAL.search(l)]
+        chars_uteis = len(re.sub(r"\W+", "", " ".join(linhas_sem_tarja)))
+        executar_ocr = precisa_ocr or chars_uteis < 150
+    else:
+        executar_ocr = precisa_ocr
+
+    if executar_ocr and TEM_PDF2IMAGE:
+        try:
+            imagens = convert_from_path(str(caminho_pdf), dpi=300, first_page=i+1, last_page=i+1)
+            if imagens:
+                texto_ocr = ocr_imagem_pil(imagens[0], idioma, aplicar_mascara=True)
+                if texto_ocr:
+                    texto = texto_ocr
+                    usou_ocr = True
+        except Exception as e:
+            print(f"    [aviso] Falha no fallback pdf2image na página {i+1}: {e}", file=sys.stderr)
 
     return texto, usou_ocr
 
@@ -367,13 +518,15 @@ def executar_ocrmypdf(
     if t_inicio is None:
         t_inicio = time.time()
 
+    workers = str(min(4, os.cpu_count() or 1))
     cmd = cmd_base + [
         "-l", idioma,
         "--rotate-pages",
         "--deskew",
         "--clean",
+        "--invalidate-digital-signatures",
         "--force-ocr" if forcar_ocr else "--skip-text",
-        "--jobs", "0",
+        "--jobs", workers,
         str(caminho_entrada),
         str(caminho_saida),
     ]
@@ -395,8 +548,13 @@ def executar_ocrmypdf(
 
         padrao_pag = re.compile(r"^\s*(\d+)\s+(?:page|\[tesseract\])")
         paginas_detectadas = set()
+        ultimas_linhas = []
 
         for linha in proc.stdout:
+            ultimas_linhas.append(linha)
+            if len(ultimas_linhas) > 30:
+                ultimas_linhas.pop(0)
+
             linha_limpa = linha.strip()
             if not linha_limpa:
                 continue
@@ -415,7 +573,8 @@ def executar_ocrmypdf(
         if proc.returncode == 0 and caminho_saida.exists() and caminho_saida.stat().st_size > 0:
             return True
         else:
-            print(f"    [aviso] OCRmyPDF retornou código {proc.returncode}. Ativando fallback...", file=sys.stderr)
+            erro_resumo = "".join(ultimas_linhas[-10:]).strip()
+            print(f"    [aviso] OCRmyPDF retornou código {proc.returncode}. Motivo: {erro_resumo}. Ativando fallback...", file=sys.stderr)
             return False
     except Exception as e:
         print(f"    [aviso] Falha ao executar OCRmyPDF: {e}. Ativando fallback...", file=sys.stderr)
@@ -458,26 +617,27 @@ def converter_pdf_para_md(caminho_pdf: Path, forcar_ocr: bool = False, idioma: s
     pdf_para_leitura = caminho_pdf
     pdf_temp_saida = None
 
-    # Antes de reescrever o PDF, identifica quais páginas já têm texto
-    # nativo suficiente — usado só para rotular corretamente (na saída)
-    # quais páginas passaram por OCR quando o modo é híbrido (--skip-text),
-    # já que nesse modo o OCRmyPDF não relata isso página a página.
+    # Identifica quais páginas realmente não possuem texto nativo útil
+    # (descontando tarjas forenses do e-SAJ, Projudi, PJe).
     paginas_sem_texto_nativo = set()
     if not forcar_ocr:
         try:
             if TEM_PYMUPDF:
                 with fitz.open(str(caminho_pdf)) as d_scan:
                     for j in range(len(d_scan)):
-                        if len(d_scan[j].get_text("text").strip()) < MIN_CHARS_TEXTO_NATIVO:
+                        t_scan = d_scan[j].get_text("text").strip()
+                        tem_imgs = len(d_scan[j].get_images()) > 0
+                        if pagina_precisa_ocr(t_scan, tem_imgs):
                             paginas_sem_texto_nativo.add(j + 1)
             elif TEM_PYPDF:
                 leitor_scan = PdfReader(str(caminho_pdf))
                 for j, pag_scan in enumerate(leitor_scan.pages):
                     try:
-                        texto_scan = (pag_scan.extract_text() or "").strip()
+                        t_scan = (pag_scan.extract_text() or "").strip()
                     except Exception:
-                        texto_scan = ""
-                    if len(texto_scan) < MIN_CHARS_TEXTO_NATIVO:
+                        t_scan = ""
+                    tem_imgs = hasattr(pag_scan, "images") and len(pag_scan.images) > 0
+                    if pagina_precisa_ocr(t_scan, tem_imgs):
                         paginas_sem_texto_nativo.add(j + 1)
         except Exception:
             pass
@@ -519,7 +679,17 @@ def converter_pdf_para_md(caminho_pdf: Path, forcar_ocr: bool = False, idioma: s
                         pagina = doc[i]
                         texto = pagina.get_text("text").strip()
                         num_pag = i + 1
-                        if forcar_ocr or num_pag in paginas_sem_texto_nativo:
+                        tem_imgs = len(pagina.get_images()) > 0
+                        # Se o OCRmyPDF pulou a página por conter tarja vetorial do tribunal, aplica OCR na imagem
+                        if pagina_precisa_ocr(texto, tem_imgs):
+                            texto_ocr, usou_ocr = processar_pagina_pymupdf(doc, i, forcar_ocr=True, idioma=idioma)
+                            if usou_ocr and texto_ocr:
+                                texto = texto_ocr
+                                paginas_ocr.append(num_pag)
+                                tag_tipo = " (OCR)"
+                            else:
+                                tag_tipo = ""
+                        elif forcar_ocr or num_pag in paginas_sem_texto_nativo:
                             paginas_ocr.append(num_pag)
                             tag_tipo = " (OCR Otimizado - OCRmyPDF)"
                         else:
@@ -550,7 +720,16 @@ def converter_pdf_para_md(caminho_pdf: Path, forcar_ocr: bool = False, idioma: s
                     pagina = leitor.pages[i]
                     texto = (pagina.extract_text() or "").strip()
                     num_pag = i + 1
-                    if forcar_ocr or num_pag in paginas_sem_texto_nativo:
+                    tem_imgs = hasattr(pagina, "images") and len(pagina.images) > 0
+                    if pagina_precisa_ocr(texto, tem_imgs):
+                        texto_ocr, usou_ocr = processar_pagina_fallback(pdf_para_leitura, i, leitor, forcar_ocr=True, idioma=idioma)
+                        if usou_ocr and texto_ocr:
+                            texto = texto_ocr
+                            paginas_ocr.append(num_pag)
+                            tag_tipo = " (OCR)"
+                        else:
+                            tag_tipo = ""
+                    elif forcar_ocr or num_pag in paginas_sem_texto_nativo:
                         paginas_ocr.append(num_pag)
                         tag_tipo = " (OCR Otimizado - OCRmyPDF)"
                     else:

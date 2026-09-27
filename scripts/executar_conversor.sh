@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # executar_conversor.sh — Execução e Monitoramento do Pipeline de Conversões
-# Copyright (c) 2026 domingossouzalima-dev — Licença MIT
 # ==============================================================================
 
 DIR_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

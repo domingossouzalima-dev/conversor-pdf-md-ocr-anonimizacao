@@ -19,38 +19,42 @@ página do PDF original cada trecho veio.
 
 ## Funcionalidades
 
-- **Extração de texto nativo primeiro.** Se o PDF já tem texto selecionável,
-  ele é extraído diretamente — nenhuma imagem é gerada, nenhum OCR roda.
-- **OCR automático como fallback, com pré-processamento via OCRmyPDF.**
-  Páginas sem texto nativo suficiente (tipicamente páginas escaneadas)
-  passam primeiro pelo `OCRmyPDF` quando disponível — que corrige
-  rotação, corrige inclinação (deskew) e remove ruído de digitalização
-  antes do OCR, resolvendo a maioria dos scans tortos/ruidosos — e só
-  então são processadas pelo Tesseract. Isso acontece por página, então
-  um PDF pode ter páginas digitais e páginas escaneadas misturadas sem
-  problema, e as páginas com texto nativo bom nunca são tocadas (modo
-  híbrido, `--skip-text`). Se o `OCRmyPDF` não estiver instalado, cai
-  automaticamente para o método manual (renderização a 300 DPI +
-  Tesseract puro, sem pré-processamento).
-- **Modo de OCR forçado (Estratégia 2).** No modo `ocr` dedicado (ou com
-  `--forcar-ocr`), o `OCRmyPDF` roda em TODAS as páginas
-  (`--force-ocr`), reprocessando mesmo as que já têm texto nativo — útil
-  quando o texto nativo existente é pouco confiável.
-- **Anonimização automática opcional.** Um motor baseado em regex e
-  heurística de nomes próprios detecta e substitui CPF, CNPJ, número de
-  processo (padrão CNJ), CEP, e-mail, telefone, RG, endereço, nomes de
-  estado/município e nomes de pessoas por rótulos como `[cpf_1]`,
-  `[nome_2]`. Gera também uma "chave de desanonimização" separada, com a
-  correspondência rótulo → texto original, para conferência humana.
-- **Desanonimização automática.** Basta soltar o documento anonimizado
-  junto com sua chave na pasta de entrada correspondente: o pipeline casa
-  os dois sozinho (mesmo com vários pares anexados de uma vez) e gera o
-  texto já revertido.
-- **Rastreabilidade.** O pipeline automatizado registra hash SHA-256 do
-  arquivo original, motor usado, páginas que precisaram de OCR e tempo de
-  conversão — tanto no cabeçalho do `.md` gerado quanto em log diário.
-- **Multiplataforma.** Testado em Linux; inclui detecção automática do
-  executável do Tesseract no Windows.
+- **Extração de texto nativo inteligente.** Se a página do PDF já tem texto digital
+  legítimo (como petições, denúncias e sentenças), o texto vetorial é extraído
+  diretamente, preservando 100% da acentuação e fidelidade ortográfica original —
+  nenhuma imagem é gerada e o texto não sofre degradação por OCR.
+- **Detecção forense de conteúdo vs. carimbos de tribunais.** Páginas escaneadas
+  em autos digitais que contêm carimbos de assinatura vetorial (e-SAJ, Projudi, PJe,
+  Eproc: *"Este documento é cópia do original assinado digitalmente por..."*, *"fls. X"*)
+  não enganam mais o conversor. As tarjas institucionais são desconsideradas no cômputo
+  de caracteres úteis, garantindo que termos de declaração, autos de prisão e ofícios
+  escaneados recebam OCR automaticamente.
+- **Mascaramento automático de margens laterais.** Elimina na raiz o problema clássico
+  de tarjas verticais de tribunais lidas na horizontal pelo Tesseract, impedindo a geração
+  de centenas de linhas de caracteres órfãos (`o`, `u`, `q`, etc.) no Markdown.
+- **Remoção morfológica de réguas e linhas de tabelas.** Formulários oficiais (DETRAN,
+  Polícia Civil, BPTran) com grades, caixas de marcação e linhas sublinhadas têm suas
+  linhas contínuas neutralizadas antes do OCR, evitando alucinações de caracteres espúrios
+  e destravando a leitura limpa do texto impresso e dados preenchidos.
+- **OCR com pré-processamento avançado e suporte a autos assinados.** Suporte a
+  `OCRmyPDF` com correção de inclinação (*deskew*), rotação automática, limpeza de ruído e
+  a flag `--invalidate-digital-signatures`, permitindo processar autos processuais com
+  certificados ICP-Brasil sem abortar por erro de assinatura.
+- **Fallback Tesseract 300 DPI robusto.** Caso o OCRmyPDF não esteja disponível ou
+  encontre restrições em documentos de grande porte, o fallback página a página aplica
+  renderização a 300 DPI, máscara de margem, binarização com contraste calibrado e
+  filtro anti-ruído pós-processamento.
+- **Anonimização automática opcional (Res. CNJ nº 615/2025).** Um motor baseado em regex
+  e heurística de nomes próprios detecta e substitui CPF, CNPJ, número de processo CNJ,
+  CEP, e-mail, telefone, RG, endereços, nomes de estados/municípios e nomes de pessoas por
+  rótulos padronizados (`[cpf_1]`, `[nome_2]`). Gera chave reversível para auditoria forense.
+- **Desanonimização automática.** Reversão com pareamento automático entre o documento
+  anonimizado e sua respectiva chave de desanonimização.
+- **Rastreabilidade completa.** Metadados com hash SHA-256 do arquivo original, motor
+  utilizado, páginas que demandaram OCR e cronometragem no cabeçalho do Markdown e logs diários.
+- **Multiplataforma e Automação Contínua.** Scripts de vigilância contínua (`--watch`) para
+  Linux (com serviço systemd de usuário) e Windows (scripts `.bat` e `.ps1` com detecção
+  automática de caminhos).
 
 ## Como funciona (visão geral)
 
@@ -58,20 +62,21 @@ página do PDF original cada trecho veio.
 PDF de entrada
      │
      ▼
-Para cada página: existe texto nativo suficiente (≥ 25 caracteres)?
+Para cada página: desconta tarjas forenses (e-SAJ/PJe).
+Existe texto nativo útil suficiente (≥ 25 caracteres)?
      │                                   │
-    sim                                  não
+    sim                                  não (ou escaneada)
      │                                   │
      ▼                                   ▼
-usa o texto extraído          OCRmyPDF disponível? (deskew + rotação +
-     │                         limpeza de ruído antes do OCR)
+Preserva texto vetorial nativo     Mascara margem lateral do carimbo
+(fidelidade total sem OCR)         e remove réguas de tabelas
      │                                   │
-     │                          sim ─────┴───── não
-     │                           │               │
-     │                           ▼               ▼
-     │                   pré-processa e faz   renderiza a imagem a
-     │                   OCR na página         300 DPI e roda
-     │                   (Tesseract)           Tesseract puro
+     │                                   ▼
+     │                             Executa OCR otimizado
+     │                             (OCRmyPDF ou Tesseract 300 DPI)
+     │                                   │
+     │                                   ▼
+     │                             Filtro anti-ruído pós-OCR
      │                                   │
      └───────────────┬───────────────────┘
                       ▼
